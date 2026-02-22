@@ -1,0 +1,1091 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useUserSession, type UserProfile } from "@/context/UserSessionContext";
+import {
+  registerUser,
+  startAssessment,
+  uploadSpeechSample,
+  submitCognitiveData,
+  requestRiskPrediction,
+  fetchAssessmentResult,
+  AssessmentResult,
+} from "@/services/api";
+import type { SpeechUploadResponse } from "@/services/api";
+import { OnboardingForm, OnboardingFormValues } from "@/components/assessment/OnboardingForm";
+import { SpeechRecorder, SpeechTask } from "@/components/assessment/SpeechRecorder";
+import AnalysisLoading from "@/components/assessment/AnalysisLoading";
+import {
+  CognitiveTasks,
+  type CognitiveTask,
+  type CognitiveCompletionPayload,
+} from "@/components/assessment/CognitiveTasks";
+import { RiskResultCard } from "@/components/assessment/RiskResultCard";
+import AnalyticsCharts from "@/components/assessment/AnalyticsCharts";
+import { toast } from "@/hooks/use-toast";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
+import { Loader2, ShieldCheck, BrainCircuit, AudioWaveform, ClipboardList, Volume2, VolumeX } from "lucide-react";
+// Removed printing from Results page header
+import { saveAssessmentResult, loadAssessmentHistory, saveEncryptedAssessmentResult, loadEncryptedAssessmentHistory } from "@/lib/history";
+import { setAudioGuideEnabled, playAudioGuide, stopAudioGuide } from "@/lib/audioGuide";
+import { fingerprint } from "@/lib/crypto";
+import { signInWithGoogle, signInWithEmail, signUpWithEmail, logoutFirebase, saveReport, loadReports, saveGlobalReport } from "@/lib/firebase";
+import { getLocalizedStrings } from "@/lib/i18n";
+
+// Temporary: enable local heuristic inference while backend model is unavailable
+const USE_LOCAL_HEURISTIC = true;
+const ENABLE_BACKEND_APIS = import.meta.env.VITE_ENABLE_BACKEND === "true";
+
+function getSpeechTasks(language: string): SpeechTask[] {
+  const i18n = getLocalizedStrings(language);
+  return [
+    {
+      id: "picture-description",
+      title: i18n["picture-description-title"],
+      description: i18n["picture-description-desc"],
+      prompt: i18n["picture-description-prompt"],
+      maxDurationMs: 120_000,
+      visualUrl: "https://images.unsplash.com/photo-1517248135467-4c7edcad34c4",
+    },
+    {
+      id: "story-immediate-recall",
+      title: i18n["story-immediate-recall-title"],
+      description: i18n["story-immediate-recall-desc"],
+      prompt: i18n["story-immediate-recall-prompt"],
+      storyScript:
+        "Ravi woke up early on Sunday and decided to visit the weekly farmer's market. He bought fresh tomatoes, leafy spinach, and sweet mangoes for his mother. On the way out, he bumped into his old friend Sunil, who invited him for tea later that evening.",
+      maxDurationMs: 120_000,
+      hideScriptDuringRecall: true,
+    },
+    {
+      id: "category-fluency",
+      title: i18n["category-fluency-title"],
+      description: i18n["category-fluency-desc"],
+      prompt: i18n["category-fluency-prompt"],
+      fluencyType: "category",
+      fluencyTarget: "Animals",
+      maxDurationMs: 60_000,
+    },
+    {
+      id: "letter-fluency",
+      title: i18n["letter-fluency-title"],
+      description: i18n["letter-fluency-desc"],
+      prompt: i18n["letter-fluency-prompt"],
+      fluencyType: "letter",
+      fluencyTarget: "K",
+      maxDurationMs: 60_000,
+    },
+    {
+      id: "procedural-description",
+      title: i18n["procedural-description-title"],
+      description: i18n["procedural-description-desc"],
+      prompt: i18n["procedural-description-prompt"],
+      maxDurationMs: 90_000,
+    },
+    {
+      id: "guided-imagery",
+      title: i18n["guided-imagery-title"],
+      description: i18n["guided-imagery-desc"],
+      prompt: i18n["guided-imagery-prompt"],
+      maxDurationMs: 90_000,
+    },
+    {
+      id: "future-planning",
+      title: i18n["future-planning-title"],
+      description: i18n["future-planning-desc"],
+      prompt: i18n["future-planning-prompt"],
+      maxDurationMs: 90_000,
+    },
+    {
+      id: "free-conversation",
+      title: i18n["free-conversation-title"],
+      description: i18n["free-conversation-desc"],
+      prompt: i18n["free-conversation-prompt"],
+      maxDurationMs: 90_000,
+    },
+    {
+      id: "story-delayed-recall",
+      title: i18n["story-delayed-recall-title"],
+      description: i18n["story-delayed-recall-desc"],
+      prompt: i18n["story-delayed-recall-prompt"],
+      maxDurationMs: 120_000,
+      hideScriptDuringRecall: true,
+      unlockAfterTaskId: "story-immediate-recall",
+      unlockDelayMs: 3 * 60 * 1000,
+    },
+    {
+      id: "self-reflection",
+      title: i18n["self-reflection-title"],
+      description: i18n["self-reflection-desc"],
+      prompt: i18n["self-reflection-prompt"],
+      maxDurationMs: 90_000,
+    },
+  ];
+}
+
+// Helpers to build randomized, non-repeating tasks per session
+function shuffle<T>(arr: T[]): T[] {
+  return [...arr].sort(() => Math.random() - 0.5);
+}
+
+function makeWordRecallTask(id: string, title: string, desc: string, promptPrefix: string, words: string[]): CognitiveTask {
+  const options = shuffle(words);
+  const sequenceAnswer = words.map((w) => options.indexOf(w));
+  return {
+    id,
+    type: "word-recall",
+    title,
+    description: desc,
+    prompt: `${promptPrefix} ${words.join(", ")}.`,
+    options,
+    sequenceAnswer,
+  };
+}
+
+function makeDigitSpanTask(id: string, title: string, desc: string, digits: number[]): CognitiveTask {
+  const pool = shuffle(Array.from(new Set([...digits, ...shuffle([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]).slice(0, 5)])));
+  const options = pool.map(String);
+  const sequenceAnswer = digits.map((d) => options.indexOf(String(d)));
+  return {
+    id,
+    type: "digit-span",
+    title,
+    description: desc,
+    prompt: digits.join(", "),
+    options,
+    sequenceAnswer,
+  };
+}
+
+const WORDS_BY_LANG: Record<string, string[]> = {
+  en: ["Apple", "Train", "Moon", "Garden", "Candle", "Bridge", "Star", "Window", "River", "Mirror", "Bottle"],
+  hi: ["सेब", "रेल", "चाँद", "बाग", "मोमबत्ती", "पुल", "तारा", "खिड़की", "नदी", "आईना", "बोतल"],
+  bn: ["আপেল", "ট্রেন", "চাঁদ", "উদ্যান", "মোমবাতি", "সেতু", "তারকা", "জানালা", "নদী", "আয়না", "বোতল"],
+  ta: ["ஆப்பிள்", "ரயில்", "நிலா", "தோட்டம்", "மெழுகுவர்த்தி", "பாலம்", "நட்சத்திரம்", "ஜன்னல்", "நதி", "கண்ணாடி", "பாட்டில்"],
+  te: ["సేపు", "రైలు", "చంద్రుడు", "తోట", "మొమబత్తి", "సేతు", "నక్షత్రం", "కిటికి", "నది", "అద్దం", "సీసా"],
+  kn: ["ಸೇಬು", "ರೈಲು", "ಚಂದ್ರ", "ತೋಟ", "ಮೆಣಬತ್ತಿ", "ಸೇತು", "ನಕ್ಷತ್ರ", "ಕಿಟಕೀ", "ನದಿ", "ಕನ್ನಡಿ", "ಸಿಸು"],
+  ml: ["ആപ്പിൾ", "ട്രെയ്ൻ", "ചന്ദ്രൻ", "തോട്ടം", "മെഴുകുതിരി", "പാലം", "നക്ഷത്രം", "ജാലകം", "നദി", "ക്കന്നാടി", "കുപ്പി"],
+  mr: ["सफरचंद", "रेल", "चंद्र", "बाग", "मेणबत्ती", "पूल", "तारा", "खिडकी", "नदी", "आरसा", "बाटली"],
+  gu: ["સફરજન", "રેલ", "ચંદ્ર", "બાગ", "મોમબત્તી", "પુલ", "તારો", "બારણું", "નદી", "અરીસો", "બોટલ"],
+  pa: ["ਸੇਬ", "ਰੇਲ", "ਚੰਦਰਮਾ", "ਬਾਗ", "ਮੋਮਬੱਤੀ", "ਪੁੱਲ", "ਤਾਰਾ", "ਖਿੜਕੀ", "ਨਦੀ", "ਸ਼ੀਸ਼ਾ", "ਬੋਤਲ"],
+};
+
+function generateCognitiveTasks(language: string): CognitiveTask[] {
+  const lex = WORDS_BY_LANG[language] ?? WORDS_BY_LANG.en;
+  const poolA = shuffle(lex).slice(0, 5);
+  const poolB = shuffle(lex.filter((w) => !poolA.includes(w))).slice(0, 5);
+
+  const i18n = getLocalizedStrings(language);
+
+  const word1 = makeWordRecallTask("word-recall", i18n["word-recall-title"], i18n["word-recall-desc"], i18n["word-recall-prompt"], poolA);
+  const word2 = makeWordRecallTask("word-recall-2", i18n["word-recall-2-title"], i18n["word-recall-desc"], i18n["word-recall-prompt"], poolB);
+
+  const digit1 = makeDigitSpanTask("digit-span", i18n["digit-span-title"], i18n["digit-span-desc"], [3, 9, 1, 4, 7]);
+  const digit2 = makeDigitSpanTask("digit-span-reverse", i18n["digit-span-reverse-title"], i18n["digit-span-desc"], [7, 2, 9, 3]);
+
+  const attention1: CognitiveTask = {
+    id: "attention-sequence",
+    type: "attention",
+    title: i18n["attention-sequence-title"],
+    description: i18n["attention-sequence-desc"],
+    prompt: i18n["attention-sequence-prompt"],
+    options: [i18n["attention-sequence-opt1"], i18n["attention-sequence-opt2"], i18n["attention-sequence-opt3"]],
+    correctAnswer: 0,
+  };
+
+  const visualSearch: CognitiveTask = {
+    id: "attention-visual",
+    type: "attention",
+    title: i18n["visual-search-title"],
+    description: i18n["visual-search-desc"],
+    prompt: i18n["visual-search-prompt"],
+    options: [i18n["visual-search-opt1"], i18n["visual-search-opt2"], i18n["visual-search-opt3"]],
+    correctAnswer: 0,
+  };
+
+  const languageVocab: CognitiveTask = {
+    id: "language-vocab",
+    type: "language",
+    title: i18n["language-vocab-title"] || "Verbal Comprehension",
+    description: i18n["language-vocab-desc"] || "Select the word most associated with the main word.",
+    prompt: i18n["language-vocab-prompt"] || "Water",
+    options: [
+      i18n["language-vocab-opt1"] || "Fire",
+      i18n["language-vocab-opt2"] || "Ocean",
+      i18n["language-vocab-opt3"] || "Sand",
+      i18n["language-vocab-opt4"] || "Moon"
+    ],
+    correctAnswer: 1, // Ocean
+  };
+
+  const clock: CognitiveTask = {
+    id: "clock-drawing",
+    type: "clock-drawing",
+    title: i18n["clock-drawing-title"],
+    description: i18n["clock-drawing-desc"],
+    prompt: i18n["clock-drawing-prompt"],
+  };
+
+  return [word1, digit1, attention1, word2, digit2, visualSearch, languageVocab, clock];
+}
+
+const LANGUAGE_LABEL: Record<string, string> = {
+  en: "English",
+  hi: "हिन्दी",
+  bn: "বাংলা",
+  ta: "தமிழ்",
+  te: "తెలుగు",
+  kn: "ಕನ್ನಡ",
+  ml: "മലയാളം",
+  mr: "मराठी",
+  gu: "ગુજરાતી",
+  pa: "ਪੰਜਾਬੀ",
+};
+
+const getStepConfig = (i18n: Record<string, string>) => [
+  {
+    id: "consent",
+    title: i18n["ui-step-consent"] || "Onboarding & Consent",
+    icon: ShieldCheck,
+  },
+  {
+    id: "speech",
+    title: i18n["ui-step-speech"] || "Speech Assessment",
+    icon: AudioWaveform,
+  },
+  {
+    id: "cognitive",
+    title: i18n["ui-step-cognitive"] || "Cognitive Tasks",
+    icon: ClipboardList,
+  },
+  {
+    id: "results",
+    title: i18n["ui-step-results"] || "AI Risk Summary",
+    icon: BrainCircuit,
+  },
+];
+
+const Assessment = () => {
+  const { user, setUser, assessmentId, setAssessmentId, clearSession, auth, setAuth } = useUserSession();
+  const [uiLanguage, setUiLanguage] = useState(user?.language || "en");
+  const [activeStepIndex, setActiveStepIndex] = useState(0);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isSpeechUploading, setIsSpeechUploading] = useState(false);
+  const [result, setResult] = useState<AssessmentResult | null>(null);
+  const speechTasks = useMemo(() => getSpeechTasks(uiLanguage), [uiLanguage]);
+  const cognitiveTasks = useMemo(() => generateCognitiveTasks(uiLanguage), [uiLanguage]);
+  const [isResultPending, setIsResultPending] = useState(false);
+  const [isAnalysisComplete, setIsAnalysisComplete] = useState(false);
+  const [history, setHistory] = useState<AssessmentResult[]>([]);
+  const reportRef = useRef<HTMLDivElement>(null);
+  const [speechDurations, setSpeechDurations] = useState<Record<string, number>>({});
+  const [speechFeedback, setSpeechFeedback] = useState<Record<string, SpeechUploadResponse>>({});
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+
+  const [analysisProgress, setAnalysisProgress] = useState(0);
+  const progressIntervalRef = useRef<number | null>(null);
+  const progressTimeoutRef = useRef<number | null>(null);
+  const minimumDurationRef = useRef<number | null>(null);
+  const analysisStartTimeRef = useRef<number | null>(null);
+
+  const i18n = useMemo(() => getLocalizedStrings(uiLanguage), [uiLanguage]);
+  const steps = useMemo(() => getStepConfig(i18n), [i18n]);
+
+  const [audioGuideEnabled, setAudioGuideEnabledState] = useState(false);
+
+  // Sync state with global audio guide module
+  useEffect(() => {
+    setAudioGuideEnabled(audioGuideEnabled);
+    if (!audioGuideEnabled) {
+      stopAudioGuide();
+    } else {
+      playAudioGuide(i18n["ui-audio-guide-enabled"] || "Audio guide activated. Instructions will be read aloud.", uiLanguage);
+    }
+  }, [audioGuideEnabled, uiLanguage, i18n]);
+
+  const activeStep = steps[activeStepIndex];
+  const isAuthenticated = !!auth;
+  const isOfflineMode = !ENABLE_BACKEND_APIS;
+  const onboardingUnlocked = isOfflineMode || isAuthenticated;
+
+  const resolveLanguageLabel = useCallback(
+    (tag?: string | null) => {
+      if (!tag) return undefined;
+      const normalized = tag.split("-")[0]?.toLowerCase();
+      if (!normalized) return tag.toUpperCase();
+      return LANGUAGE_LABEL[normalized] ?? tag.toUpperCase();
+    },
+    [],
+  );
+
+  useEffect(() => {
+    setResult(null);
+    setAnalysisProgress(0);
+    setIsAnalysisComplete(false);
+    setSpeechFeedback({});
+  }, [assessmentId]);
+
+  const clearAnalysisTimers = useCallback(() => {
+    if (progressIntervalRef.current !== null) {
+      window.clearInterval(progressIntervalRef.current);
+      progressIntervalRef.current = null;
+    }
+    if (progressTimeoutRef.current !== null) {
+      window.clearTimeout(progressTimeoutRef.current);
+      progressTimeoutRef.current = null;
+    }
+    if (minimumDurationRef.current !== null) {
+      window.clearTimeout(minimumDurationRef.current);
+      minimumDurationRef.current = null;
+    }
+    analysisStartTimeRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    if (!isResultPending) {
+      clearAnalysisTimers();
+      return;
+    }
+
+    clearAnalysisTimers();
+    setAnalysisProgress(12);
+    setIsAnalysisComplete(false);
+    analysisStartTimeRef.current = Date.now();
+    minimumDurationRef.current = window.setTimeout(() => {
+      minimumDurationRef.current = null;
+    }, 10_000);
+    progressIntervalRef.current = window.setInterval(() => {
+      setAnalysisProgress((prev) => {
+        const increment = Math.random() * 12 + 5;
+        const next = Math.min(prev + increment, 92);
+        if (next >= 92 && progressIntervalRef.current !== null) {
+          window.clearInterval(progressIntervalRef.current);
+          progressIntervalRef.current = null;
+        }
+        return next;
+      });
+    }, 900);
+
+    return () => {
+      clearAnalysisTimers();
+    };
+  }, [isResultPending, clearAnalysisTimers]);
+
+  const finalizeAnalysis = useCallback(() => {
+    const releaseResults = () => {
+      clearAnalysisTimers();
+      setAnalysisProgress(100);
+      progressTimeoutRef.current = window.setTimeout(() => {
+        setIsResultPending(false);
+        setIsAnalysisComplete(true);
+        setAnalysisProgress(0);
+        progressTimeoutRef.current = null;
+        analysisStartTimeRef.current = null;
+      }, 800);
+    };
+
+    if (minimumDurationRef.current === null) {
+      releaseResults();
+    } else {
+      const elapsed = analysisStartTimeRef.current ? Date.now() - analysisStartTimeRef.current : 0;
+      const remaining = Math.max(0, 10_000 - elapsed);
+      window.clearTimeout(minimumDurationRef.current);
+      minimumDurationRef.current = null;
+      progressTimeoutRef.current = window.setTimeout(() => {
+        releaseResults();
+      }, remaining);
+    }
+  }, [analysisProgress, clearAnalysisTimers]);
+
+  useEffect(() => {
+    (async () => {
+      if (auth?.provider === "firebase") {
+        const arr = await loadReports(auth.userId);
+        setHistory(arr);
+      } else if (auth?.provider === "local") {
+        const arr = await loadEncryptedAssessmentHistory(auth.userId, auth.password || "");
+        setHistory(arr);
+      } else if (user) {
+        setHistory(loadAssessmentHistory(user.id));
+      }
+    })();
+  }, [auth, user]);
+
+  const advanceStep = useCallback(() => {
+    setActiveStepIndex((index) => Math.min(index + 1, steps.length - 1));
+  }, [steps.length]);
+
+  const resetAssessment = () => {
+    clearSession();
+    setActiveStepIndex(0);
+    setResult(null);
+    setIsResultPending(false);
+  };
+
+  // Local encrypted auth (anonymous ID derived from email) and printing
+  const handleAuthLogin = async () => {
+    if (!authEmail || !authPassword) {
+      toast({ title: "Enter email and password" });
+      return;
+    }
+    const anon = await fingerprint(authEmail.toLowerCase());
+    setAuth({ userId: anon, email: authEmail, password: authPassword, provider: "local" });
+    try {
+      const arr = await loadEncryptedAssessmentHistory(anon, authPassword);
+      setHistory(arr);
+    } catch { }
+    toast({ title: "Signed in", description: "Your reports will be stored encrypted under this login." });
+  };
+
+  const handleAuthSignup = handleAuthLogin; // same local flow
+
+  const handleAuthLogout = () => {
+    if (auth?.provider === "firebase") {
+      logoutFirebase().catch(() => undefined);
+    }
+    setAuth(null);
+    setHistory([]);
+    setAuthEmail("");
+    setAuthPassword("");
+  };
+
+  const handlePrint = () => {
+    window.print();
+  };
+
+  const formatAuthError = (error: unknown) => {
+    const message =
+      typeof error === "object" && error && "message" in error
+        ? String((error as { message: string }).message)
+        : typeof error === "string"
+          ? error
+          : "";
+    if (message.includes("auth/email-already-in-use")) return "This email is already registered. Try logging in instead.";
+    if (message.includes("auth/invalid-email")) return "That email address looks invalid.";
+    if (message.includes("auth/missing-email")) return "Enter an email address.";
+    if (message.includes("auth/missing-password")) return "Enter your password.";
+    if (message.includes("auth/weak-password")) return "Choose a password with at least 6 characters.";
+    if (message.includes("auth/wrong-password")) return "Incorrect password. Please try again.";
+    if (message.includes("auth/user-not-found")) return "No account found with that email. Sign up first.";
+    if (message.includes("network")) return "Network issue—check your connection and try again.";
+    return "Something went wrong. Please try again.";
+  };
+
+  const requireCloudSignIn = () => {
+    if (isOfflineMode) {
+      return false;
+    }
+    if (!isAuthenticated) {
+      toast({
+        title: "Sign in required",
+        description: "Please log in to your account first to unlock the assessment workflow.",
+      });
+      return true;
+    }
+    return false;
+  };
+
+  const createOfflineSession = useCallback(
+    (values: OnboardingFormValues, reason?: string) => {
+      // Use standard ID format so it's globally scannable via QR
+      const offlineAssessmentId = `A-${Date.now()}`;
+      const offlineUser: UserProfile = {
+        id: offlineAssessmentId,
+        name: values.name,
+        age: values.age,
+        language: uiLanguage,
+        consent: values.consent,
+      };
+      setUser(offlineUser);
+      setAssessmentId(offlineAssessmentId);
+      toast({
+        title: "Consent stored locally",
+        description:
+          reason ??
+          "You are in privacy-first mode. Your details stay on this device so you can continue safely.",
+      });
+      advanceStep();
+    },
+    [advanceStep, setAssessmentId, setUser],
+  );
+
+  const handleOnboardingSubmit = async (values: OnboardingFormValues) => {
+    setIsLoading(true);
+    if (!ENABLE_BACKEND_APIS) {
+      createOfflineSession(values);
+      setIsLoading(false);
+      return;
+    }
+    if (requireCloudSignIn()) {
+      setIsLoading(false);
+      return;
+    }
+    try {
+      const payload = {
+        name: values.name,
+        age: values.age,
+        gender: values.gender,
+        education: values.education,
+        family_history: values.family_history,
+        diabetes: values.diabetes,
+        hypertension: values.hypertension,
+        depression: values.depression,
+        head_injury: values.head_injury,
+        sleep_quality: values.sleep_quality,
+        physical_activity: values.physical_activity,
+        smoking: values.smoking,
+        alcohol_consumption: values.alcohol_consumption,
+        diet_quality: values.diet_quality,
+        height: values.height,
+        weight: values.weight,
+
+        language: uiLanguage,
+        consent: values.consent,
+      };
+      const response = await registerUser(payload);
+      setUser({
+        id: response.user.id,
+        name: response.user.name,
+        age: response.user.age,
+        gender: response.user.gender,
+        education: response.user.education,
+        // Map response fields back to session
+        family_history: response.user.family_history,
+        diabetes: response.user.diabetes,
+        hypertension: response.user.hypertension,
+        depression: response.user.depression,
+        head_injury: response.user.head_injury,
+        sleep_quality: response.user.sleep_quality,
+        physical_activity: response.user.physical_activity,
+        smoking: response.user.smoking,
+        alcohol_consumption: response.user.alcohol_consumption,
+        diet_quality: response.user.diet_quality,
+        height: response.user.height,
+        weight: response.user.weight,
+
+        language: response.user.language,
+        consent: response.user.consent,
+        accessToken: response.accessToken,
+      });
+
+      const assessment = await startAssessment(response.accessToken);
+      setAssessmentId(assessment.assessmentId);
+      toast({
+        title: "Registration successful",
+        description: "You can now begin your spoken assessment.",
+      });
+      advanceStep();
+    } catch (error) {
+      console.error(error);
+      createOfflineSession(values, "Backend unavailable. Switched to privacy-first mode and kept your data local.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleSpeechUpload = async ({ taskId, blob, durationMs }: { taskId: string; blob: Blob; durationMs: number; metadata?: Record<string, unknown> }) => {
+    if (requireCloudSignIn()) return;
+    if (!assessmentId || !user) {
+      toast({
+        title: "Assessment not started",
+        description: "Please complete onboarding first.",
+      });
+      return;
+    }
+
+    if (!ENABLE_BACKEND_APIS) {
+      setSpeechDurations((prev) => ({ ...prev, [taskId]: durationMs }));
+      setSpeechFeedback((prev) => {
+        if (!(taskId in prev)) return prev;
+        const next = { ...prev };
+        delete next[taskId];
+        return next;
+      });
+      toast({
+        title: "Speech sample saved locally",
+        description: `Recorded ${Math.round(durationMs / 1000)} seconds for ${taskId}.`,
+      });
+      return;
+    }
+
+    try {
+      setIsSpeechUploading(true);
+      const response = await uploadSpeechSample({
+        assessmentId,
+        taskId,
+        blob,
+        language: uiLanguage,
+        accessToken: user.accessToken,
+        // pass duration to backend for analytics
+        durationMs,
+      });
+
+      // track duration locally for heuristic risk if backend is unavailable
+      setSpeechDurations((prev) => ({ ...prev, [taskId]: durationMs }));
+      setSpeechFeedback((prev) => ({ ...prev, [taskId]: response }));
+
+      const detectedLabel = resolveLanguageLabel(response.detectedLanguage);
+      const selectedLabel = resolveLanguageLabel(uiLanguage);
+      const confidenceText =
+        typeof response.languageConfidence === "number"
+          ? ` (confidence ${Math.round(response.languageConfidence * 100)}%)`
+          : "";
+      const baseDescription = `Recorded ${Math.round(durationMs / 1000)} seconds for ${taskId}.`;
+      const detectedDescription = response.detectedLanguage
+        ? `Detected ${detectedLabel ?? response.detectedLanguage.toUpperCase()}${confidenceText}.`
+        : "";
+
+      if (!response.success) {
+        toast({
+          title: "Speech processing failed",
+          description: response.warnings?.join(" ") || "We could not process this sample. Please try again.",
+          variant: "destructive",
+        });
+      } else if (response.languageMismatch) {
+        toast({
+          title: "Language mismatch detected",
+          description: `${baseDescription} ${detectedDescription} Selected language: ${selectedLabel || uiLanguage.toUpperCase()
+            }`,
+          variant: "destructive",
+        });
+      } else {
+        toast({
+          title: "Speech sample processed",
+          description: [baseDescription, detectedDescription].filter(Boolean).join(" "),
+        });
+      }
+
+      if (response.warnings?.length) {
+        toast({
+          title: "Speech processing notes",
+          description: response.warnings.join(" "),
+          variant: response.languageMismatch ? "destructive" : "default",
+        });
+      }
+    } catch (error) {
+      console.error(error);
+      toast({
+        title: "Upload failed",
+        description: error instanceof Error ? error.message : "Check your connection and try again.",
+      });
+    } finally {
+      setIsSpeechUploading(false);
+    }
+  };
+
+  const handleSpeechComplete = () => {
+    toast({
+      title: "Speech tasks done",
+      description: "Continue with the cognitive exercises.",
+    });
+    advanceStep();
+  };
+
+  const handleCognitiveComplete = async ({ logs, scores, clockDrawing }: CognitiveCompletionPayload) => {
+    if (!assessmentId || !user) {
+      toast({
+        title: "Assessment not started",
+        description: "Please complete onboarding first.",
+      });
+      return;
+    }
+
+    try {
+      setIsLoading(true);
+      // Move to Results first for smoother UX
+      advanceStep();
+      setIsResultPending(true);
+
+      // Always persist cognitive data to backend if available (non-blocking for heuristic mode)
+      if (ENABLE_BACKEND_APIS && user.accessToken) {
+        try {
+          await submitCognitiveData(
+            {
+              assessmentId,
+              logs,
+              cognitiveScores: scores,
+              clockDrawing,
+            },
+            user.accessToken,
+          );
+        } catch { }
+      }
+
+      if (USE_LOCAL_HEURISTIC) {
+        // Simple heuristic without ML: combine normalized cognitive scores and speech coverage
+        const domainMax = { memoryScore: 2, attentionScore: 4, languageScore: 1, executiveScore: 1 } as const;
+        const mem = Math.min(1, scores.memoryScore / domainMax.memoryScore);
+        const att = Math.min(1, scores.attentionScore / domainMax.attentionScore);
+        const lang = Math.min(1, scores.languageScore / domainMax.languageScore);
+        const exec = Math.min(1, scores.executiveScore / domainMax.executiveScore);
+        const cognitiveAvg = (mem + att + lang + exec) / 4;
+
+        const expected = speechTasks.map((t) => t.maxDurationMs ?? 60_000);
+        const recorded = speechTasks.map((t) => Math.min(speechDurations[t.id] ?? 0, t.maxDurationMs ?? 60_000));
+        const coverage = recorded.length
+          ? recorded.reduce((a, b, i) => a + (expected[i] ? b / expected[i] : 0), 0) / recorded.length
+          : 0.5; // neutral if no speech
+
+        // Risk is inverse of performance; clamp to [0.02, 0.98]
+        let probability = 1 - (0.7 * cognitiveAvg + 0.3 * coverage);
+        probability = Math.min(0.98, Math.max(0.02, probability));
+
+        const riskLevel = probability > 0.66 ? "High" : probability > 0.33 ? "Medium" : "Low";
+        const featureImportances: Array<{ feature: string; contribution: number; direction: "positive" | "negative" }> = [
+          { feature: "memory_score", contribution: 0.5 - mem, direction: (mem < 0.5 ? "positive" : "negative") as "positive" | "negative" },
+          { feature: "attention_score", contribution: 0.5 - att, direction: (att < 0.5 ? "positive" : "negative") as "positive" | "negative" },
+          { feature: "language_score", contribution: 0.5 - lang, direction: (lang < 0.5 ? "positive" : "negative") as "positive" | "negative" },
+          { feature: "executive_score", contribution: 0.5 - exec, direction: (exec < 0.5 ? "positive" : "negative") as "positive" | "negative" },
+          { feature: "speech_coverage", contribution: 0.5 - Math.min(1, coverage), direction: (coverage < 0.5 ? "positive" : "negative") as "positive" | "negative" },
+        ];
+
+        const heuristic: AssessmentResult = {
+          assessmentId,
+          riskLevel,
+          probability,
+          featureImportances,
+          subScores: scores,
+          recommendations: [
+            "Try a longer picture description (aim for ~60–90s).",
+            "Practice digit span and word recall to boost attention and memory.",
+            "Share this report with a clinician for guidance—this is not a diagnosis.",
+          ],
+          generatedAt: new Date().toISOString(),
+        };
+
+        setResult(heuristic);
+        try {
+          if (auth?.provider === "firebase") {
+            await saveReport(auth.userId, heuristic);
+            const arr = await loadReports(auth.userId);
+            setHistory(arr);
+          } else if (auth?.provider === "local") {
+            await saveEncryptedAssessmentResult(auth.userId, heuristic, auth.password || "");
+            const arr = await loadEncryptedAssessmentHistory(auth.userId, auth.password || "");
+            setHistory(arr);
+          } else if (user) {
+            saveAssessmentResult(user.id, heuristic);
+            setHistory(loadAssessmentHistory(user.id));
+          }
+          await saveGlobalReport(heuristic, { name: user.name, age: user.age, language: user.language });
+        } catch (e) {
+          console.error("Error saving assessment result:", e);
+        }
+        finalizeAnalysis();
+        return;
+      }
+
+      // Otherwise, call backend prediction and poll
+      if (ENABLE_BACKEND_APIS && user.accessToken) {
+        try {
+          await requestRiskPrediction(assessmentId, user.accessToken);
+        } catch (e) {
+          console.error("Error requesting risk prediction:", e);
+        }
+      }
+
+      const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+      let fetched: AssessmentResult | null = null;
+      for (let i = 0; i < 15; i++) {
+        try {
+          if (!ENABLE_BACKEND_APIS || !user.accessToken) {
+            break;
+          }
+          fetched = await fetchAssessmentResult(assessmentId, user.accessToken);
+          break;
+        } catch (err) {
+          await sleep(1000);
+        }
+      }
+      if (fetched) {
+        setResult(fetched);
+        try {
+          if (auth?.provider === "firebase") {
+            await saveReport(auth.userId, fetched);
+            const arr = await loadReports(auth.userId);
+            setHistory(arr);
+          } else if (auth?.provider === "local") {
+            await saveEncryptedAssessmentResult(auth.userId, fetched, auth.password || "");
+            const arr = await loadEncryptedAssessmentHistory(auth.userId, auth.password || "");
+            setHistory(arr);
+          } else if (user) {
+            saveAssessmentResult(user.id, fetched);
+            setHistory(loadAssessmentHistory(user.id));
+          }
+          await saveGlobalReport(fetched, { name: user.name, age: user.age, language: user.language });
+        } catch (e) {
+          console.error("Error saving fetched result:", e);
+        }
+        finalizeAnalysis();
+      } else {
+        toast({ title: "Prediction pending", description: "Result is taking longer than usual. Please wait a few seconds and retry." });
+        finalizeAnalysis();
+      }
+    } catch (error) {
+      console.error(error);
+      toast({ title: "Prediction failed", description: error instanceof Error ? error.message : "Please try again later." });
+      finalizeAnalysis();
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const languageLabel = useMemo(() => (LANGUAGE_LABEL[uiLanguage] ?? uiLanguage), [uiLanguage]);
+
+  return (
+    <div className="min-h-screen py-20 px-4 sm:px-6 lg:px-8">
+      <div className="max-w-5xl mx-auto space-y-10">
+        <header className="space-y-4 text-center">
+          <Badge variant="secondary">{i18n["ui-clinical-workflow"] || "Clinical Screening Workflow"}</Badge>
+          <h1 className="text-4xl font-bold text-foreground">{i18n["ui-app-title"] || "Mindful Cognitive Screening"}</h1>
+          <p className="text-muted-foreground">
+            {i18n["ui-app-desc"] || "Complete a guided onboarding, record speech samples, finish cognitive tasks, and view an AI-powered dementia risk summary in your preferred language."}
+          </p>
+        </header>
+
+        <Card className="shadow-card border-primary/20 bg-primary/5">
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold flex items-center gap-2">
+              <ClipboardList className="w-5 h-5" />
+              {i18n["ui-language-select"] || "Select Language"}
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="flex gap-4 flex-wrap">
+              {Object.entries(LANGUAGE_LABEL).map(([code, label]) => (
+                <Button
+                  key={code}
+                  variant={uiLanguage === code ? "default" : "outline"}
+                  className="rounded-full"
+                  onClick={() => setUiLanguage(code)}
+                >
+                  {label}
+                </Button>
+              ))}
+            </div>
+          </CardContent>
+          <div className="border-t border-primary/10 px-6 py-4 flex items-center justify-between">
+            <span className="text-sm font-medium flex items-center gap-2">
+              {audioGuideEnabled ? <Volume2 className="h-4 w-4 text-primary" /> : <VolumeX className="h-4 w-4 text-muted-foreground" />}
+              {i18n["ui-audio-guide"] || "Audio Guide (for Visually Impaired)"}
+            </span>
+            <Button
+              variant={audioGuideEnabled ? "default" : "outline"}
+              size="sm"
+              onClick={() => setAudioGuideEnabledState(!audioGuideEnabled)}
+              className="rounded-full"
+            >
+              {audioGuideEnabled ? "Enabled" : "Disabled"}
+            </Button>
+          </div>
+        </Card>
+
+        {/* Account options */}
+        <Card className="shadow-card">
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold text-muted-foreground">{i18n["ui-account-title"] || "Account"}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {!auth ? (
+              <div className="space-y-5">
+                <div>
+                  <p className="text-sm font-medium mb-2">{i18n["ui-auth-cloud-title"] || "Use secure cloud backup (optional)"}</p>
+                  <div className="flex gap-2 flex-wrap items-end">
+                    <Button onClick={async () => {
+                      try {
+                        const u = await signInWithGoogle();
+                        setAuth({ provider: "firebase", userId: u.uid, email: u.email || "" });
+                        const arr = await loadReports(u.uid);
+                        setHistory(arr);
+                        setAuthEmail("");
+                        setAuthPassword("");
+                        toast({ title: "Signed in with Google", description: "Onboarding is now unlocked." });
+                      } catch (e) {
+                        toast({ title: "Google sign-in failed", description: formatAuthError(e) });
+                      }
+                    }}>{i18n["ui-auth-google-btn"] || "Continue with Google"}</Button>
+                    <div className="grid gap-2 sm:grid-cols-[1fr_1fr_auto_auto] items-end flex-1 min-w-[320px]">
+                      <input type="email" placeholder={i18n["ui-auth-email-placeholder"] || "you@example.com"} className="w-full px-3 py-2 rounded-lg border border-border bg-card text-foreground" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} />
+                      <input type="password" placeholder={i18n["ui-auth-password-placeholder"] || "Password"} className="w-full px-3 py-2 rounded-lg border border-border bg-card text-foreground" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} />
+                      <Button variant="outline" onClick={async () => {
+                        if (!authEmail || !authPassword) {
+                          toast({ title: "Missing credentials", description: "Enter both email and password." });
+                          return;
+                        }
+                        try {
+                          const u = await signInWithEmail(authEmail, authPassword);
+                          setAuth({ provider: "firebase", userId: u.uid, email: u.email || "" });
+                          const arr = await loadReports(u.uid);
+                          setHistory(arr);
+                          setAuthEmail("");
+                          setAuthPassword("");
+                          toast({ title: "Logged in", description: "Assessment steps unlocked." });
+                        } catch (e) {
+                          toast({ title: "Login failed", description: formatAuthError(e) });
+                        }
+                      }}>{i18n["ui-auth-login-btn"] || "Log in"}</Button>
+                      <Button className="btn-hero" onClick={async () => {
+                        if (!authEmail || !authPassword) {
+                          toast({ title: "Missing credentials", description: "Enter both email and password." });
+                          return;
+                        }
+                        if (authPassword.length < 6) {
+                          toast({ title: "Weak password", description: "Password must be at least 6 characters." });
+                          return;
+                        }
+                        try {
+                          const u = await signUpWithEmail(authEmail, authPassword);
+                          setAuth({ provider: "firebase", userId: u.uid, email: u.email || "" });
+                          setHistory([]);
+                          setAuthEmail("");
+                          setAuthPassword("");
+                          toast({ title: "Account created", description: "You can now start onboarding." });
+                        } catch (e) { toast({ title: "Sign up failed", description: formatAuthError(e) }); }
+                      }}>{i18n["ui-auth-signup-btn"] || "Sign up"}</Button>
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-2">{i18n["ui-auth-storage-cloud-note"] || "Storage: Encrypted cloud workspace linked to your email (assessment reports and derived scores only)."}</p>
+                </div>
+                <div>
+                  <p className="text-sm font-medium mb-2">{i18n["ui-auth-local-title"] || "Or use local-only encrypted storage (device)"}</p>
+                  <div className="grid gap-3 sm:grid-cols-[1fr_1fr_auto_auto] items-end">
+                    <div>
+                      <label className="block text-xs mb-1 text-muted-foreground">{i18n["ui-auth-local-email-label"] || "Email (for anonymous ID)"}</label>
+                      <input type="email" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-border bg-card text-foreground" placeholder={i18n["ui-auth-email-placeholder"] || "you@example.com"} />
+                    </div>
+                    <div>
+                      <label className="block text-xs mb-1 text-muted-foreground">{i18n["ui-auth-local-password-label"] || "Local Password"}</label>
+                      <input type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-border bg-card text-foreground" placeholder={i18n["ui-auth-password-placeholder"] || "••••••••"} />
+                    </div>
+                    <Button variant="outline" onClick={handleAuthLogin}>{i18n["ui-auth-login-btn"] || "Log in"}</Button>
+                    <Button className="btn-hero" onClick={handleAuthSignup}>{i18n["ui-auth-signup-btn"] || "Sign up"}</Button>
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-2">{i18n["ui-auth-storage-local-note"] || "Storage: Encrypted in your browser (LocalStorage). Data stays on this device."}</p>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between">
+                <div className="text-sm text-muted-foreground">{i18n["ui-auth-signed-in-as"] || "Signed in as"} <strong>{auth.email}</strong> ({auth.provider === "firebase" ? i18n["ui-auth-cloud-backup"] || "Cloud backup" : i18n["ui-auth-local-encrypted"] || "On-device encrypted"}) ID: {auth.userId}</div>
+                <Button variant="outline" onClick={handleAuthLogout}>{i18n["ui-auth-signout-btn"] || "Sign out"}</Button>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {!isAuthenticated && (
+          <Card className="border-yellow-500/60 bg-yellow-500/5">
+            <CardContent className="py-6">
+              <div className="space-y-2 text-sm">
+                <p className="font-semibold text-yellow-700">{i18n["ui-auth-signin-required"] || "Sign in to continue"}</p>
+                <p className="text-muted-foreground">
+                  {i18n["ui-auth-signin-note"] || "For security, the assessment workflow only unlocks after you log in using the options above. Once signed in, onboarding and recording steps will become available."}
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        <Card className="shadow-card">
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold text-muted-foreground">{i18n["ui-assessment-progress"] || "Assessment Progress"}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid gap-4 sm:grid-cols-4">
+              {steps.map((step, index) => {
+                const Icon = step.icon;
+                const isActive = index === activeStepIndex;
+                const isCompleted = index < activeStepIndex;
+                return (
+                  <div
+                    key={step.id}
+                    className={`rounded-xl border p-4 text-center transition ${isActive
+                      ? "border-primary bg-primary/10 text-primary"
+                      : isCompleted
+                        ? "border-green-500/60 bg-green-500/10 text-green-600"
+                        : "border-border bg-muted/30 text-muted-foreground"
+                      }`}
+                  >
+                    <Icon className="mx-auto mb-2 h-8 w-8" />
+                    <p className="text-sm font-medium">{step.title}</p>
+                  </div>
+                );
+              })}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Separator />
+
+        {activeStep.id === "consent" && isAuthenticated && (
+          <div className="max-w-3xl mx-auto">
+            <OnboardingForm
+              user={user}
+              onSubmit={handleOnboardingSubmit}
+              isLoading={isLoading}
+              uiLanguage={uiLanguage}
+              i18n={i18n}
+            />
+          </div>
+        )}
+
+        {activeStep.id === "speech" && isAuthenticated && user && assessmentId && (
+          <div className="space-y-6">
+            <SpeechRecorder
+              language={uiLanguage}
+              tasks={speechTasks}
+              feedback={speechFeedback}
+              isUploading={isSpeechUploading}
+              onUpload={handleSpeechUpload}
+              onComplete={handleSpeechComplete}
+            />
+          </div>
+        )}
+
+        {activeStep.id === "cognitive" && assessmentId && user && (
+          <div className="space-y-6">
+            <CognitiveTasks
+              tasks={cognitiveTasks}
+              onComplete={handleCognitiveComplete}
+              isSubmitting={isLoading}
+              language={user.language}
+            />
+          </div>
+        )}
+
+        {activeStep.id === "results" && (
+          <div className="space-y-6">
+            {isResultPending && <AnalysisLoading progress={analysisProgress} />}
+            {!isResultPending && isAnalysisComplete && result && (
+              <>
+                <div ref={reportRef} className="space-y-6">
+                  <RiskResultCard result={result} languageLabel={languageLabel} history={history} patientName={user?.name} />
+                  <AnalyticsCharts result={result} history={history} />
+                </div>
+              </>
+            )}
+
+            <div className="flex flex-wrap gap-4 justify-between">
+              <div className="space-y-2 text-sm text-muted-foreground">
+                <p>
+                  Need clinical review? Share your anonymized assessment ID with healthcare professionals:
+                  <strong> {assessmentId}</strong>
+                </p>
+                <p>All speech and cognitive data remain encrypted at rest and in transit.</p>
+              </div>
+              <div className="flex gap-2">
+                <Button onClick={handlePrint}>Download PDF</Button>
+                <Button variant="outline" onClick={resetAssessment}>
+                  Start New Assessment
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default Assessment;
